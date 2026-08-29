@@ -1,5 +1,13 @@
-# Modified from hradec/ComfyUI-HR-Endless-Sampler:
-# adds optional manual per-chunk descriptions (chunk_descriptions).
+# Modified from hradec/ComfyUI-HR-Endless-Sampler.
+#
+# Change: adds an optional `chunk_descriptions` input and a
+# `chunk_description_log` output to HREndlessSampler, allowing manual
+# per-chunk detailed_description text to replace the Gemma 4 director.
+# When manual blocks are supplied, Gemma 4 is not constructed and
+# llama_cpp is never imported. With the input empty, behaviour is
+# unchanged from upstream.
+#
+# Licensed under the Apache License, Version 2.0, as is the original.
 
 import hashlib
 import json
@@ -526,6 +534,81 @@ def _preview_shot_ranges(prompt, total_frames, preview_end, fps):
             "source_end": shot_end - 1,
         })
     return ranges
+
+
+MANUAL_CHUNK_SEPARATOR = re.compile(r"(?m)^[ \t]*-{3,}[ \t]*$")
+
+
+def _parse_manual_chunk_descriptions(text):
+    """Split the manual chunk_descriptions widget into per-chunk blocks.
+
+    An empty widget returns an empty tuple, which leaves the ordinary Gemma
+    path untouched. Blocks are separated by a line containing only dashes.
+
+    Whole lines whose first non-space character is ``#`` are dropped before
+    splitting. That lets a generator emit a configuration header above the
+    first block without the header being mistaken for chunk 1.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ()
+    kept = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    blocks = [block.strip() for block in MANUAL_CHUNK_SEPARATOR.split("\n".join(kept))]
+    return tuple(block for block in blocks if block)
+
+
+def _validate_manual_chunk_descriptions(blocks, chunk_count):
+    """Check the block count against the plan before anything is sampled.
+
+    Too few blocks is fatal: a later chunk would have no text, and the run
+    would fail only after earlier chunks had already spent minutes sampling.
+    Too many is survivable, so it is reported rather than raised.
+    Returns the log string for the chunk_description_log output.
+    """
+    if not blocks:
+        return "chunk_descriptions is empty; the ordinary prompt planner is in use."
+
+    if len(blocks) == 1:
+        return (f"1 block supplied for {chunk_count} chunk(s). "
+                "The single block is reused for every chunk.")
+
+    if len(blocks) < chunk_count:
+        raise ValueError(
+            f"chunk_descriptions has {len(blocks)} blocks but this configuration plans "
+            f"{chunk_count} chunks. Supply {chunk_count} blocks separated by a line of "
+            f"three dashes, or a single block to reuse for every chunk. "
+            f"Nothing has been sampled."
+        )
+
+    if len(blocks) > chunk_count:
+        unused = len(blocks) - chunk_count
+        message = (
+            f"TOO MANY BLOCKS: {len(blocks)} supplied but only {chunk_count} chunk(s) "
+            f"are planned. Blocks {chunk_count + 1}-{len(blocks)} ({unused} block(s)) "
+            f"will not be rendered.\n"
+            "Unused block openings:\n"
+            + "\n".join(
+                f"  block {i + 1}: {blocks[i][:70]}{'...' if len(blocks[i]) > 70 else ''}"
+                for i in range(chunk_count, len(blocks))
+            )
+        )
+        logging.warning("HR Endless Sampler %s", message.splitlines()[0])
+        return message
+
+    return f"{len(blocks)} block(s) supplied for {chunk_count} chunk(s); counts match."
+
+
+def _manual_description_for_chunk(blocks, index):
+    """One block per chunk, or a single block reused for every chunk."""
+    if not blocks:
+        return None
+    if len(blocks) == 1:
+        return blocks[0]
+    if index < len(blocks):
+        return blocks[index]
+    raise ValueError(
+        f"chunk_descriptions has {len(blocks)} blocks but chunk {index + 1} was requested. "
+        "Supply one block per active chunk, or a single block to reuse."
+    )
 
 
 def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content_start=None, continuation=False,
@@ -1697,6 +1780,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Completed continuation tail length. MiniMax H3 currently uses the synchronized Ref2VA <Audio N> + <Video N> continuation path; values at or above chunk_frames are clamped to the effective chunk size."),
                 io.Vae.Input("vae", optional=True,
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
+                io.String.Input("chunk_descriptions", optional=True, multiline=True, default="",
+                                tooltip="Optional manual per-chunk detailed_description text, replacing the Gemma 4 director entirely. Separate chunks with a line containing only ---. One block per active chunk; a single block is reused for every chunk. When set, Gemma and llama-cpp-python are never loaded."),
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=True,
@@ -1713,6 +1798,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Latent.Output(display_name="denoised_output"),
                 io.String.Output(display_name="chunk_prompts", tooltip="Exact planned prompt and frame ranges for every active chunk."),
                 HREndlessTimeline.Output(display_name="timeline", tooltip="Finished chunk, shot, and Gemma prompt metadata for HR Endless Sampler Save Video."),
+                io.String.Output(display_name="chunk_description_log", tooltip="Status of the manual chunk_descriptions input: block count, chunk count, and any unused blocks."),
             ],
         )
 
@@ -1723,7 +1809,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=5, vae=None, cache_gemma_preproduction=False,
+                video_continuation=5, vae=None, chunk_descriptions="", cache_gemma_preproduction=False,
                 gemma4_mtp=True,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0,
                 **_deprecated_inputs):
@@ -1750,14 +1836,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
             if prompt_preview_only:
                 raise ValueError("prompt_preview_only requires a MiniMax H3 nested video/audio latent")
             sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
-            return io.NodeOutput(sampled[0], sampled[1], "", normalize_timeline(None, fps=fps, total_frames=0))
+            return io.NodeOutput(sampled[0], sampled[1], "", normalize_timeline(None, fps=fps, total_frames=0), "")
 
         streams = samples.unbind()
         if len(streams) != 2 or streams[0].ndim != 5 or streams[0].shape[1] != 24 or streams[1].ndim != 4 or streams[1].shape[1] != 32:
             if prompt_preview_only:
                 raise ValueError("prompt_preview_only requires MiniMax H3 24-channel video and 32-channel audio latents")
             sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
-            return io.NodeOutput(sampled[0], sampled[1], "", normalize_timeline(None, fps=fps, total_frames=0))
+            return io.NodeOutput(sampled[0], sampled[1], "", normalize_timeline(None, fps=fps, total_frames=0), "")
 
         video, audio = streams
         context_keyframes = int(context_keyframes_enable) * context_keyframes
@@ -1798,7 +1884,17 @@ class HREndlessSampler(SamplerCustomAdvanced):
             raise ValueError("debug_start_chunk cannot be greater than debug_stop_chunk")
         active_plan = plan if debug_stop_chunk == 0 else plan[:debug_stop_chunk]
         _gemma_markers, gemma_shots, _gemma_description_end = _parse_prompt_shots(prompt, plan[-1]["frame_end"], fps)
-        gemma_director_needed = bool(gemma_shots)
+        manual_descriptions = _parse_manual_chunk_descriptions(chunk_descriptions)
+        gemma_director_needed = bool(gemma_shots) and not manual_descriptions
+        chunk_description_log = _validate_manual_chunk_descriptions(
+            manual_descriptions, len(active_plan))
+        if manual_descriptions:
+            logging.info(
+                "HR Endless Sampler: using %d manual chunk description block(s) for %d chunk(s); "
+                "the Gemma 4 director and llama-cpp-python are disabled for this run.",
+                len(manual_descriptions),
+                len(active_plan),
+            )
 
         original_conds = guider.original_conds
         positive = original_conds.get("positive")
@@ -1858,7 +1954,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 fps=fps,
                 total_frames=active_plan[-1]["frame_end"],
             )
-            return io.NodeOutput(latent_image, latent_image, prompt_preview, preview_timeline)
+            return io.NodeOutput(latent_image, latent_image, prompt_preview, preview_timeline, chunk_description_log)
 
         if len(active_plan) > 1 and "noise_mask" in latent_image:
             raise ValueError("HR Endless Sampler does not support denoise masks when chunking")
@@ -2648,6 +2744,19 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         continuation_audio_label=continuation_audio_label,
                     )
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
+                elif manual_descriptions:
+                    manual_text = _manual_description_for_chunk(manual_descriptions, index)
+                    continuation_video_label = f"<Video {video_number}>" if continuation and include_video1_reference else None
+                    continuation_audio_label = f"<Audio {audio_number}>" if continuation and include_video1_reference else None
+                    chunk_prompt = _prompt_with_gemma_description(
+                        prompt,
+                        manual_text,
+                        drop_picture_anchors=continuation and not ref2va,
+                        continuation_video_label=continuation_video_label,
+                        continuation_audio_label=continuation_audio_label,
+                    )
+                    gemma_description = manual_text
+                    debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt)
                 else:
                     chunk_prompt, debug_prompt = planned_prompts[index]
                     if gemma_report is not None:
@@ -2955,6 +3064,6 @@ class HREndlessSampler(SamplerCustomAdvanced):
             fps=fps,
             total_frames=rendered_frames,
         )
-        return io.NodeOutput(output_template, denoised_template, "\n\n".join(debug_prompts), timeline)
+        return io.NodeOutput(output_template, denoised_template, "\n\n".join(debug_prompts), timeline, chunk_description_log)
 
     sample = execute
