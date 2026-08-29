@@ -1,3 +1,6 @@
+# Modified from hradec/ComfyUI-HR-Endless-Sampler:
+# adds optional manual per-chunk descriptions (chunk_descriptions).
+
 import hashlib
 import json
 import logging
