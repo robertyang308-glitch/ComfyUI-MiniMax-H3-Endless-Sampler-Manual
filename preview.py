@@ -637,7 +637,7 @@ class HREndlessSamplerPreview(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="HREndlessSamplerPreview",
-            display_name="HR Endless Sampler Preview",
+            display_name="Endless Sampler Preview",
             category="model/sampling/custom",
             description="Accumulates live previews across HR Endless Sampler chunks.",
             inputs=[

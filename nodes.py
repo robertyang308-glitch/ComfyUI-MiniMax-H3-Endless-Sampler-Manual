@@ -556,6 +556,47 @@ def _parse_manual_chunk_descriptions(text):
     return tuple(block for block in blocks if block)
 
 
+def _header_number_pattern(key):
+    return re.compile(
+        r"(?im)^[ \t]*#[ \t]*" + re.escape(key) + r"[ \t]*[=:][ \t]*([0-9,\s]+)$")
+
+
+MANUAL_HEADER_CHUNK_FRAMES = _header_number_pattern("chunk_frames")
+MANUAL_HEADER_CONTEXT_KEYFRAMES = _header_number_pattern("context_keyframes")
+
+
+def _parse_header_numbers(text, key, pattern):
+    """Read an optional `# <key> = ...` header from chunk_descriptions.
+
+    Returns None when absent, an int for a single value, or a list of ints
+    for a comma-separated list. A value here overrides the node widget.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    match = pattern.search(text)
+    if match is None:
+        return None
+    values = [part.strip() for part in match.group(1).split(",") if part.strip()]
+    if not values:
+        return None
+    try:
+        numbers = [int(value) for value in values]
+    except ValueError as error:
+        raise ValueError(
+            f"chunk_descriptions header '# {key} = {match.group(1).strip()}' "
+            "must be one integer or a comma-separated list of integers"
+        ) from error
+    return numbers[0] if len(numbers) == 1 else numbers
+
+
+def _parse_header_chunk_frames(text):
+    return _parse_header_numbers(text, "chunk_frames", MANUAL_HEADER_CHUNK_FRAMES)
+
+
+def _parse_header_context_keyframes(text):
+    return _parse_header_numbers(text, "context_keyframes", MANUAL_HEADER_CONTEXT_KEYFRAMES)
+
+
 def _validate_manual_chunk_descriptions(blocks, chunk_count):
     """Check the block count against the plan before anything is sampled.
 
@@ -1003,6 +1044,96 @@ def _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames=5):
         audio_end = next_audio_end
         remaining -= new_video_t
 
+    return plan
+
+
+def _chunk_plan_variable(video_t, audio_t, chunk_sizes, overlap_frames=5):
+    """Chunk plan with a per-chunk span, and optionally a per-chunk overlap.
+
+    ``chunk_sizes`` is a list of spans in frames, each on H3's 17k+5 grid and
+    each interpreted exactly as the ``chunk_frames`` widget is. The list must
+    cover the latent exactly; a short or long list raises.
+
+    ``overlap_frames`` is one value for every chunk, or a list with one entry
+    per chunk. Entry 1 is ignored because the first chunk has nothing to
+    overlap; every other entry must be on the 17k+5 grid and strictly smaller
+    than its own span.
+    """
+    if isinstance(overlap_frames, (list, tuple)):
+        overlaps = list(overlap_frames)
+        if len(overlaps) != len(chunk_sizes):
+            raise ValueError(
+                f"context_keyframes list has {len(overlaps)} entries but chunk_frames "
+                f"has {len(chunk_sizes)}. Supply one overlap per chunk, or a single value."
+            )
+    else:
+        overlaps = [overlap_frames] * len(chunk_sizes)
+    if video_t < MIN_VIDEO_STEPS or (video_t - MIN_VIDEO_STEPS) % 5:
+        raise ValueError("HR Endless Sampler expects a MiniMax H3 video latent on the 17k+5 frame grid")
+    total_frames = _pixel_frames(video_t)
+    if audio_t != _audio_steps(total_frames):
+        raise ValueError("HR Endless Sampler expects a MiniMax H3 audio latent matching the video duration")
+
+    plan = []
+    video_end = 0
+    audio_end = 0
+    output_frames = 0
+    remaining = video_t
+
+    for position, size in enumerate(chunk_sizes):
+        if remaining <= 0:
+            raise ValueError(
+                f"chunk_frames list has {len(chunk_sizes)} entries but the latent is "
+                f"covered after {position}. Remove the extra entries."
+            )
+        snapped = size - (size - 5) % 17
+        if snapped != size:
+            raise ValueError(
+                f"chunk_frames entry {position + 1} is {size}; use H3's 17k+5 grid "
+                f"(nearest valid value is {snapped})"
+            )
+        max_chunk_t = _video_steps(size)
+        overlap = overlaps[position]
+        context_video_t = _bounded_video_steps(
+            overlap, size, f"context_keyframes entry {position + 1}")
+
+        if not plan:
+            chunk_t = min(max_chunk_t, remaining)
+            video_start = 0
+            new_video_t = chunk_t
+        else:
+            new_video_t = min(max_chunk_t - context_video_t, remaining)
+            chunk_t = new_video_t + context_video_t
+            video_start = video_end - context_video_t
+        chunk_frame_count = _pixel_frames(chunk_t)
+
+        output_frames += chunk_frame_count if not plan else chunk_frame_count - overlap
+        next_audio_end = _audio_steps(output_frames)
+        chunk_audio_t = _audio_steps(chunk_frame_count)
+        new_audio_t = next_audio_end - audio_end
+        chunk_context_audio_t = 0 if not plan else chunk_audio_t - new_audio_t
+        audio_start = 0 if not plan else audio_end - chunk_context_audio_t
+
+        plan.append({
+            "video_start": video_start,
+            "video_end": video_start + chunk_t,
+            "audio_start": audio_start,
+            "audio_end": next_audio_end,
+            "context_video_t": 0 if not plan else context_video_t,
+            "context_audio_t": chunk_context_audio_t,
+            "output_trim_frames": 0 if not plan else overlap,
+            "frame_start": 0 if not plan else output_frames - chunk_frame_count,
+            "frame_end": output_frames,
+        })
+        video_end += new_video_t
+        audio_end = next_audio_end
+        remaining -= new_video_t
+
+    if remaining > 0:
+        raise ValueError(
+            f"chunk_frames list covers {output_frames} of {total_frames} frames; "
+            f"{_pixel_frames(remaining)} frames are unaccounted for. Add more entries."
+        )
     return plan
 
 
@@ -1754,13 +1885,29 @@ class _SamplerTiming:
 
 
 class HREndlessSampler(SamplerCustomAdvanced):
+    # Advanced subclasses honour `# chunk_frames` / `# context_keyframes`
+    # headers inside chunk_descriptions and expose validate_only.
+    ADVANCED = False
+
     @classmethod
     def define_schema(cls):
+        advanced_inputs = [
+            io.Boolean.Input("validate_only", default=False,
+                             tooltip="Plan and validate only: check the chunk layout, spans, overlaps and chunk_descriptions block count, then return without sampling. No model is loaded for sampling."),
+        ] if cls.ADVANCED else []
         return io.Schema(
-            node_id="HREndlessSampler",
-            display_name="HR Endless Sampler",
+            node_id="HREndlessSamplerAdvanced" if cls.ADVANCED else "HREndlessSampler",
+            display_name="Endless Sampler (Advanced)" if cls.ADVANCED else "Endless Sampler",
             category="model/sampling/custom",
-            description="Samples a long video latent as continuation-guided temporal chunks. Replace SamplerCustomAdvanced and set the largest chunk that fits in VRAM. The current chunking backend is MiniMax H3.",
+            description=(
+                "Samples a long video latent as continuation-guided temporal chunks. "
+                "Advanced adds per-chunk spans and overlaps declared in the chunk_descriptions "
+                "header, plus a validate_only dry run. The current chunking backend is MiniMax H3."
+                if cls.ADVANCED else
+                "Samples a long video latent as continuation-guided temporal chunks. "
+                "Replace SamplerCustomAdvanced and set the largest chunk that fits in VRAM. "
+                "The current chunking backend is MiniMax H3."
+            ),
             inputs=[
                 io.Noise.Input("noise", lazy=True),
                 io.Guider.Input("guider"),
@@ -1782,6 +1929,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
                 io.String.Input("chunk_descriptions", optional=True, multiline=True, default="",
                                 tooltip="Optional manual per-chunk detailed_description text, replacing the Gemma 4 director entirely. Separate chunks with a line containing only ---. One block per active chunk; a single block is reused for every chunk. When set, Gemma and llama-cpp-python are never loaded."),
+                *advanced_inputs,
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=True,
@@ -1809,7 +1957,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=5, vae=None, chunk_descriptions="", cache_gemma_preproduction=False,
+                video_continuation=5, vae=None, chunk_descriptions="", validate_only=False,
+                cache_gemma_preproduction=False,
                 gemma4_mtp=True,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0,
                 **_deprecated_inputs):
@@ -1851,6 +2000,35 @@ class HREndlessSampler(SamplerCustomAdvanced):
         video_continuation = int(video_continuation_enable) * video_continuation
         max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
         requested_video_continuation = video_continuation
+        header_chunk_frames = (
+            _parse_header_chunk_frames(chunk_descriptions) if cls.ADVANCED else None)
+        header_context_keyframes = (
+            _parse_header_context_keyframes(chunk_descriptions) if cls.ADVANCED else None)
+        chunk_frames_source = "node widget"
+        if isinstance(header_chunk_frames, int):
+            chunk_frames = header_chunk_frames
+            chunk_frames_source = "chunk_descriptions header"
+        elif isinstance(header_chunk_frames, list):
+            # The widget still bounds continuation validation, so track the
+            # largest span the variable plan will actually use.
+            chunk_frames = max(header_chunk_frames)
+            chunk_frames_source = f"chunk_descriptions header ({len(header_chunk_frames)} explicit spans)"
+        if chunk_frames_source != "node widget":
+            logging.info("HR Endless Sampler chunk_frames comes from the %s", chunk_frames_source)
+
+        if isinstance(header_context_keyframes, int):
+            context_keyframes = header_context_keyframes
+            guide_overlap = header_context_keyframes
+            logging.info("HR Endless Sampler context_keyframes comes from the chunk_descriptions header")
+        elif isinstance(header_context_keyframes, list):
+            # Validation happens per entry inside the variable planner; the
+            # widget path only needs a representative value for bounds checks.
+            context_keyframes = max(header_context_keyframes)
+            guide_overlap = context_keyframes
+            logging.info(
+                "HR Endless Sampler context_keyframes comes from the chunk_descriptions header "
+                "(%d explicit overlaps)", len(header_context_keyframes))
+
         context_keyframes, guide_overlap, video_continuation, guide_video_t = _continuation_controls(
             context_keyframes,
             guide_overlap,
@@ -1873,7 +2051,20 @@ class HREndlessSampler(SamplerCustomAdvanced):
         # after sampling. With keyframes disabled, retain the minimum synthetic
         # five-frame prefix needed to preserve H3's temporal packing phase.
         if context_keyframes:
-            plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, context_keyframes)
+            plan = (
+                _chunk_plan_variable(video.shape[2], audio.shape[-1], header_chunk_frames,
+                                     header_context_keyframes
+                                     if isinstance(header_context_keyframes, list)
+                                     else context_keyframes)
+                if isinstance(header_chunk_frames, list)
+                else _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, context_keyframes)
+            )
+        elif isinstance(header_chunk_frames, list):
+            plan = _chunk_plan_variable(video.shape[2], audio.shape[-1], header_chunk_frames, 5)
+            for position in range(1, len(plan)):
+                entry = plan[position].copy()
+                entry["output_trim_frames"] = 0
+                plan[position] = entry
         else:
             plan = _chunk_plan_without_overlap(video.shape[2], audio.shape[-1], chunk_frames)
         if debug_stop_chunk > len(plan):
@@ -1888,6 +2079,55 @@ class HREndlessSampler(SamplerCustomAdvanced):
         gemma_director_needed = bool(gemma_shots) and not manual_descriptions
         chunk_description_log = _validate_manual_chunk_descriptions(
             manual_descriptions, len(active_plan))
+        if validate_only:
+            lines = [
+                "VALIDATION ONLY - nothing was sampled.",
+                f"  chunk_frames source: {chunk_frames_source}",
+                f"  effective chunk_frames: {chunk_frames}",
+                f"  context_keyframes (overlap): {context_keyframes}",
+                f"  fps: {fps}",
+                f"  total frames: {plan[-1]['frame_end']}"
+                f"  ({plan[-1]['frame_end'] / fps:.3f} s)",
+                f"  chunks planned: {len(plan)}"
+                + (f", active after debug_stop_chunk: {len(active_plan)}"
+                   if len(active_plan) != len(plan) else ""),
+                "",
+                "  chunk   span (frames)   delivered      trim   local end",
+            ]
+            for index, chunk in enumerate(active_plan, 1):
+                span = chunk["frame_end"] - chunk["frame_start"]
+                trim = chunk.get("output_trim_frames", 0)
+                lines.append(
+                    f"  {index:>5}   {chunk['frame_start']:>6}-{chunk['frame_end'] - 1:<6}"
+                    f"  {chunk['frame_start'] + trim:>6}-{chunk['frame_end'] - 1:<6}"
+                    f"  {trim:>4}   0:{(span - 1) / fps:06.3f}"
+                )
+            lines.append("")
+            lines.append("  " + chunk_description_log.replace("\n", "\n  "))
+            report = "\n".join(lines)
+            logging.info("HR Endless Sampler %s", report)
+            return io.NodeOutput(latent_image, latent_image, report,
+                                 normalize_timeline(
+                                     {
+                                         "fps": fps,
+                                         "total_frames": active_plan[-1]["frame_end"],
+                                         "chunks": [
+                                             {
+                                                 "chunk": index + 1,
+                                                 "start": chunk["frame_start"] + chunk.get("output_trim_frames", 0),
+                                                 "end": chunk["frame_end"] - 1,
+                                             }
+                                             for index, chunk in enumerate(active_plan)
+                                         ],
+                                         "shots": _preview_shot_ranges(
+                                             prompt, plan[-1]["frame_end"],
+                                             active_plan[-1]["frame_end"], fps),
+                                     },
+                                     fps=fps,
+                                     total_frames=active_plan[-1]["frame_end"],
+                                 ),
+                                 report)
+
         if manual_descriptions:
             logging.info(
                 "HR Endless Sampler: using %d manual chunk description block(s) for %d chunk(s); "
@@ -3067,3 +3307,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
         return io.NodeOutput(output_template, denoised_template, "\n\n".join(debug_prompts), timeline, chunk_description_log)
 
     sample = execute
+
+
+class HREndlessSamplerAdvanced(HREndlessSampler):
+    """HR Endless Sampler with per-chunk spans, per-chunk overlaps, and a dry run."""
+
+    ADVANCED = True

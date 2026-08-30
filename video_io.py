@@ -833,7 +833,7 @@ class HREndlessSamplerSaveVideo(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="HREndlessSamplerSaveVideo",
-            display_name="HR Endless Sampler Save Video",
+            display_name="Endless Sampler Save Video",
             category="image/video",
             description=("Saves rendered frames with HR Endless Sampler chunk/shot metadata. "
                          "H.264 uses ComfyUI's native encoder; extra formats use VHS; video/exr writes an unclamped EXR sequence."),
@@ -1066,7 +1066,7 @@ class HREndlessSamplerLoadVideo(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="HREndlessSamplerLoadVideo",
-            display_name="HR Endless Sampler Load Video",
+            display_name="Endless Sampler Load Video",
             category="image/video",
             description=("Browse ComfyUI output folders or upload a local video and open it immediately in the timeline player. "
                          "A timeline sidecar is preferred over embedded metadata."),
