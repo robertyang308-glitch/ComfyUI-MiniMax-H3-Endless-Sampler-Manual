@@ -9,16 +9,75 @@ Upstream behaviour is unchanged when the new inputs are left empty.
 
 ---
 
-## Two nodes
+## The two sampler nodes
 
-**Endless Sampler** — the basic node. Upstream behaviour plus
-`chunk_descriptions`, with `chunk_frames` and `context_keyframes` taken
-from the widgets as usual.
+### Endless Sampler
 
-**Endless Sampler (Advanced)** — adds per-chunk spans and overlaps
-declared in the `chunk_descriptions` header, and a `validate_only` dry
-run. Start with the basic node; move up when a single uniform chunk size
-stops fitting the material.
+The basic node. Behaves as upstream does, with one addition:
+`chunk_descriptions`, where you supply the `detailed_description` text for
+each chunk yourself.
+
+Chunk layout is uniform and comes from the node widgets. `chunk_frames`
+sets the span of every chunk; `context_keyframes` sets how many frames
+each chunk re-samples from the previous one before trimming them. The
+planner divides the latent into equal chunks and you write one block per
+chunk, in order.
+
+Use it when the material is even — a single continuous scene, a steady
+camera, no hard cuts — or when you are starting out and want one number to
+reason about instead of a list.
+
+**Inputs added:** `chunk_descriptions`
+**Outputs added:** `chunk_description_log`
+**Headers in `chunk_descriptions`:** ignored, treated as comments
+
+### Endless Sampler (Advanced)
+
+Everything the basic node does, plus control of the chunk layout itself
+and a way to check that layout before spending render time on it.
+
+**Per-chunk spans.** `chunk_frames` becomes an upper limit rather than a
+fixed size. A `# chunk_frames =` header line inside `chunk_descriptions`
+can give every chunk its own span, so a boundary can be placed exactly on
+a cut instead of wherever an even division happens to fall.
+
+**Per-chunk overlaps.** `# context_keyframes =` does the same for the
+overlap. Raise it where a boundary sits inside continuous motion or a
+spoken line and the next chunk needs more context to continue from; drop
+it to 5 or 0 at a real cut, where there is no motion to carry across and
+a large overlap only wastes sampling time.
+
+```
+# chunk_frames      = 141, 90, 90, 56
+# context_keyframes =   5, 22,  5,  5
+```
+
+Both lists must have exactly one entry per chunk and the same length as
+each other. Spans and overlaps must sit on H3's grid,
+`(value - 5) % 17 == 0`, and every overlap must be strictly smaller than
+its own span. A mismatch raises with the offending entry number.
+
+**`validate_only`.** Plans and validates, then returns without sampling
+and without loading a model for it. Reports the chunk table, spans,
+overlaps, trims, local end times, and the block count. A layout mistake
+costs a second instead of an hour.
+
+Use it when the material varies — cuts to land on, dialogue not to split,
+long static stretches that could take bigger chunks than the busy parts.
+
+**Inputs added:** `chunk_descriptions`, `validate_only`
+**Outputs added:** `chunk_description_log`
+**Headers in `chunk_descriptions`:** `# chunk_frames` and
+`# context_keyframes` override the widgets
+
+### Which to use
+
+Start with the basic node. Move to Advanced when you find yourself
+choosing a chunk size that suits one part of a piece and hurts another, or
+when a cut keeps landing in the middle of a chunk.
+
+Both nodes read the same `chunk_descriptions` format, so a set of blocks
+written for one works in the other. Only the header lines change meaning.
 
 ## What this fork adds
 
@@ -82,13 +141,19 @@ Derive one description block per chunk from the base prompt, each on its
 own **local** timeline starting at 0:00.000, and paste them into
 `chunk_descriptions` separated by `---`.
 
-`docs/chunk_descriptions_guide.md` is a complete specification for this
-step: span selection, local timelines, continuation from the overlapped
-frames, concurrency defaults, `[Shot N]` semantics, the
-`In a continuous movement,` requirement for unmarked camera moves,
-`Name (<Subject N>)` conventions, and verbatim dialogue repeated across
-every overlapping block. It is written to be handed to any writing tool,
-or followed by hand.
+Two specifications are provided, one per node:
+
+- `docs/chunk_descriptions_guide_basic.md` — uniform chunks. You are told
+  the span and the chunk count; you write the blocks.
+- `docs/chunk_descriptions_guide_advanced.md` — you are told only
+  `max_chunk_frames`, and you design the layout: how many chunks, what
+  span each uses, and how much each overlaps, before writing the blocks.
+
+Both cover local timelines, continuation from the overlapped frames,
+concurrency defaults, `[Shot N]` semantics, the `In a continuous
+movement,` requirement for unmarked camera moves, `Name (<Subject N>)`
+conventions, and verbatim dialogue repeated across every overlapping
+block. Either can be handed to a writing tool or followed by hand.
 
 ### Finding the chunk count
 
