@@ -96,6 +96,26 @@ chunk_count = 1                                   if total_frames <= chunk_frame
               1 + ceil((total_frames - chunk_frames) / new_frames_per_chunk)
 ```
 
+## Writing the blocks with an LLM
+
+`docs/chunk_descriptions_prompt_block.md` is a self-contained instruction
+block for generating `chunk_descriptions` with any capable model, local or
+hosted. It encodes the rules the upstream Gemma director works to, taken
+from the project's own `gemma4_prompts.txt`: local per-chunk timelines,
+continuation from carried frames, concurrency defaults, `[Shot N]` marker
+semantics, the `In a continuous movement,` requirement for unmarked camera
+moves, `Name (<Subject N>)` conventions, and verbatim dialogue repeated
+across every overlapping slice.
+
+It is written for `chunk_frames = 141`, `fps = 24`,
+`video_continuation = 22`, and contains an "Adapting this block" section
+with the general formulas for any other configuration.
+
+The block also emits a `#` comment header recording the settings it
+assumed, which the sampler ignores when parsing. That makes a generated
+file self-describing, and lets you check the `# chunks =` value against
+`chunk_description_log` to catch a mismatch before rendering.
+
 ## What you give up
 
 The director sees the rendered stills from the previous chunk and treats
