@@ -91,10 +91,14 @@ Run once with `chunk_descriptions` empty and read `Preparing N chunks` from
 the console, or compute it:
 
 ```
-new frames per chunk = chunk_frames - video_continuation
-chunk_count = 1                                   if total_frames <= chunk_frames
-              1 + ceil((total_frames - chunk_frames) / new_frames_per_chunk)
+chunk_count = 1                                        if total_frames <= chunk_frames
+              1 + ceil((total_frames - chunk_frames) / (chunk_frames - 5))
 ```
+
+Chunk 1 spans `chunk_frames`; later chunks span `chunk_frames - 5`, because
+only the first chunk carries the +5 of H3's 17k+5 latent grid. This assumes
+the default `context_keyframes = 0`, where chunks are adjacent. A non-zero
+`context_keyframes` adds overlap that is sampled and then trimmed.
 
 ## Writing the blocks with an LLM
 
@@ -108,7 +112,7 @@ moves, `Name (<Subject N>)` conventions, and verbatim dialogue repeated
 across every overlapping slice.
 
 It is written for `chunk_frames = 141`, `fps = 24`,
-`video_continuation = 22`, and contains an "Adapting this block" section
+`context_keyframes = 0`, and contains an "Adapting this block" section
 with the general formulas for any other configuration.
 
 The block also emits a `#` comment header recording the settings it
