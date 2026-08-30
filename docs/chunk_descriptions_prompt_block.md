@@ -11,16 +11,17 @@ dialogue, sounds, outcomes, and real cuts.
 ## Fixed configuration
 - chunk_frames = 141 (exactly 8x17+5, no snapping)
 - fps = 24
-- video_continuation = 22
+- context_keyframes = 0 (chunks are adjacent, no overlap)
 - total duration = supplied with the request, in seconds
 
 ## Derived values you must compute
 - total_frames = round(total_seconds x 24)
-- new frames per chunk: chunk 1 = 141; every later chunk = 141 - 22 = 119
+- chunk 1 spans 141 frames (5.875 s). Every later chunk spans 136 frames
+  (5.667 s): only the first chunk carries the +5 of H3's 17k+5 grid.
 - chunk_count = 1 if total_frames <= 141,
-  otherwise 1 + ceil((total_frames - 141) / 119)
-- A full chunk spans 141 frames = 5.875 s. The last chunk is usually
-  shorter: its span is whatever remains, so keep it proportionally brief.
+  otherwise 1 + ceil((total_frames - 141) / 136)
+- The last chunk is usually shorter than 136: its span is whatever
+  remains, so keep it proportionally brief.
 
 ## Required output header
 Begin the output with these six comment lines, filled in, before the
@@ -30,7 +31,7 @@ header is safe to leave in place.
 ```
 # chunk_frames = 141
 # fps = 24
-# video_continuation = 22
+# context_keyframes = 0
 # total duration (seconds) = <total_seconds>
 # total duration (frames) = <total_frames>
 # chunks = <chunk_count>
@@ -42,12 +43,15 @@ two separate lines, never combined.
 
 ## Local timeline
 Every chunk restarts its clock at 0:00.000. Source and global timestamps
-are planning context only and must never appear as markers. Valid range
-in a full chunk is 0:00.000 to 0:05.833.
+are planning context only and must never appear as markers.
+Valid range: chunk 1 is 0:00.000 to 0:05.833 (141 frames); every later
+full chunk is 0:00.000 to 0:05.625 (136 frames).
 
-## Continuation and carried frames
-Chunks 2+ open on 22 frames (0.917 s) already rendered by the previous
-chunk. Continue from the state those frames left. Never restart an action
+## Continuation
+Chunks are adjacent: chunk 2 begins on the frame after chunk 1 ends, with
+no overlap and nothing discarded. The sampler still conditions each chunk
+on the previous chunk's tail, so continuity is generated rather than
+stitched. Continue from the state the previous chunk left. Never restart an action
 whose result is already visible, never replay a completed action, never
 re-establish a subject, never reset a camera move that is mid-travel.
 Write only what plausibly occurs inside this slice, and stop at the state
@@ -112,7 +116,7 @@ three dashes.
 ```
 # chunk_frames = 141
 # fps = 24
-# video_continuation = 22
+# context_keyframes = 0
 # total duration (seconds) = 12.250
 # total duration (frames) = 294
 # chunks = 3
@@ -134,13 +138,13 @@ The numbers above are for `chunk_frames = 141`, `fps = 24`,
 
 - `chunk_frames` must sit on H3's grid: `(chunk_frames - 5) % 17 == 0`.
   Valid values include 56, 90, 124, 141, 175, 209.
-- new frames per chunk = `chunk_frames - video_continuation`
-  (chunk 1 always gets the full `chunk_frames`)
+- chunk 1 spans `chunk_frames`; every later chunk spans `chunk_frames - 5`
 - `chunk_count` = 1 if `total_frames <= chunk_frames`, otherwise
-  `1 + ceil((total_frames - chunk_frames) / (chunk_frames - video_continuation))`
-- a full chunk's local range is `0:00.000` to `(chunk_frames - 1) / fps`,
-  so 141 frames at 24 fps gives 0:05.833
-- carried duration = `video_continuation / fps` seconds
+  `1 + ceil((total_frames - chunk_frames) / (chunk_frames - 5))`
+- chunk 1 local range is `0:00.000` to `(chunk_frames - 1) / fps`;
+  later chunks end at `(chunk_frames - 6) / fps`
+- this assumes `context_keyframes = 0`. A non-zero value adds overlap,
+  which is re-sampled and then trimmed, changing both counts.
 
 Update every hardcoded figure in the sections above when you change these,
 including the ceiling in the local-timeline rule.
@@ -148,7 +152,7 @@ including the ceiling in the local-timeline rule.
 ## Self-check
 1. Header present, all six lines, one bare number each, mutually consistent.
 2. Block count equals the `# chunks =` value exactly.
-3. No timestamp exceeds 0:05.833 in a full chunk; all are local.
+3. No timestamp exceeds 0:05.833 in chunk 1 or 0:05.625 later; all local.
 4. Blocks 2+ continue motion; nothing completed is replayed.
 5. Every unmarked camera move starts `In a continuous movement,`.
 6. Dialogue is verbatim, and repeated in every overlapping block.
