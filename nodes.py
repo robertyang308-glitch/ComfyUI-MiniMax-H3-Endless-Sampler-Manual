@@ -1082,9 +1082,16 @@ def _chunk_plan_variable(video_t, audio_t, chunk_sizes, overlap_frames=5):
 
     for position, size in enumerate(chunk_sizes):
         if remaining <= 0:
+            wanted = sum(chunk_sizes[:1]) + sum(
+                size - overlaps[index] for index, size in enumerate(chunk_sizes) if index)
             raise ValueError(
-                f"chunk_frames list has {len(chunk_sizes)} entries but the latent is "
-                f"covered after {position}. Remove the extra entries."
+                f"chunk_frames list has {len(chunk_sizes)} entries, but the latent is "
+                f"only {total_frames} frames and is fully covered after {position} of "
+                f"them.\n"
+                f"  Those {len(chunk_sizes)} spans would deliver about {wanted} frames.\n"
+                f"  Either shorten the list to {position} entries, or lengthen the "
+                f"latent to about {wanted} frames "
+                f"({wanted - (wanted - 5) % 17} is the nearest valid length at or below)."
             )
         snapped = size - (size - 5) % 17
         if snapped != size:
@@ -1131,8 +1138,9 @@ def _chunk_plan_variable(video_t, audio_t, chunk_sizes, overlap_frames=5):
 
     if remaining > 0:
         raise ValueError(
-            f"chunk_frames list covers {output_frames} of {total_frames} frames; "
-            f"{_pixel_frames(remaining)} frames are unaccounted for. Add more entries."
+            f"chunk_frames list covers {output_frames} of the latent's {total_frames} "
+            f"frames; {total_frames - output_frames} frames are unaccounted for. "
+            f"Add more entries, or shorten the latent to {output_frames} frames."
         )
     return plan
 
@@ -2060,10 +2068,15 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 else _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, context_keyframes)
             )
         elif isinstance(header_chunk_frames, list):
+            # Mirror _chunk_plan_without_overlap: keep the five-frame trim, but
+            # shift the starts past it and mark the prefix synthetic, so the
+            # Video1 boundary guide finds the packing prefix it expects.
             plan = _chunk_plan_variable(video.shape[2], audio.shape[-1], header_chunk_frames, 5)
             for position in range(1, len(plan)):
                 entry = plan[position].copy()
-                entry["output_trim_frames"] = 0
+                entry["video_start"] += entry["context_video_t"]
+                entry["audio_start"] += entry["context_audio_t"]
+                entry["synthetic_prefix"] = True
                 plan[position] = entry
         else:
             plan = _chunk_plan_without_overlap(video.shape[2], audio.shape[-1], chunk_frames)

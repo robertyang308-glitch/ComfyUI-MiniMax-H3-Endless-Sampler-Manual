@@ -19,11 +19,15 @@ use the Advanced node and its guide instead.
 - the base prompt
 
 ## Derived values
-- total_frames = round(total_seconds x fps)
+- total_frames = round(total_seconds x fps), then snapped down so that
+  `(total_frames - 5) % 17 == 0`. The latent snaps itself, so an off-grid
+  total silently becomes the next valid value below.
 - chunk 1 delivers `chunk_frames`; every later chunk delivers
-  `chunk_frames - context_keyframes`
+  `chunk_frames - max(context_keyframes, 5)`. A five-frame prefix is kept
+  and trimmed on every chunk after the first, even at
+  `context_keyframes = 0`.
 - chunk_count = 1 if total_frames <= chunk_frames, otherwise
-  `1 + ceil((total_frames - chunk_frames) / (chunk_frames - context_keyframes))`
+  `1 + ceil((total_frames - chunk_frames) / (chunk_frames - max(context_keyframes, 5)))`
 - a chunk's local range is `0:00.000` to `(chunk_frames - 1) / fps`
 - the last chunk is usually shorter, so keep its block proportionally brief
 
@@ -133,6 +137,7 @@ into hard relief. Her expression tightens.
 1. Header present, one bare number per value, all lines consistent.
 2. Block count equals the `# chunks =` value exactly.
 3. No timestamp exceeds `(chunk_frames - 1) / fps`; all are local.
+3b. `total_frames` is on the grid: `(total_frames - 5) % 17 == 0`.
 4. Blocks 2+ continue motion; nothing completed is replayed.
 5. Every unmarked camera move starts `In a continuous movement,`.
 6. Dialogue is verbatim, and repeated in every overlapping block.

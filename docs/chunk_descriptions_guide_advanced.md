@@ -43,13 +43,19 @@ Valid spans sit on H3's grid, `(span - 5) % 17 == 0`:
 ```
 
 **Chunk 1 delivers its full span. Every later chunk delivers
-`span - overlap`**, because the overlap re-samples frames the previous
-chunk already produced and trims them from the output. So the delivered
-total is:
+`span - max(overlap, 5)`.** The sampler always keeps a five-frame prefix
+on chunks after the first and trims it from the output, so five frames per
+chunk are spent whatever the overlap says. So the delivered total is:
 
 ```
-span_1 + (span_2 - overlap_2) + (span_3 - overlap_3) + ...
+span_1 + (span_2 - max(overlap_2, 5)) + (span_3 - max(overlap_3, 5)) + ...
 ```
+
+`context_keyframes = 0` removes the *carried content* — chunk 2 no longer
+re-samples anything real from chunk 1 — but the five-frame prefix remains
+as padding and is still trimmed. Setting 0 therefore buys no extra frames,
+only less continuity. Since the cost is identical either way, 5 is the
+better default unless you specifically want independent chunks.
 
 Choose spans so this reaches `total_frames`. The final chunk is truncated
 automatically to whatever remains, so overshooting on the last entry is
@@ -83,7 +89,9 @@ chunk's span:
 0    5   22   39   56   ...
 ```
 
-Entry 1 is ignored: the first chunk has nothing to overlap.
+Entry 1 is ignored: the first chunk has nothing to overlap. Entries of 0
+and 5 cost the same five frames; only 22 and above buy extra carried
+content at extra cost.
 
 ### How to choose overlaps
 The overlap buys conditioning context across a boundary, and costs the
@@ -218,7 +226,8 @@ into hard relief. Her expression tightens.
    consistent.
 2. `# chunk_frames` has exactly one entry per block, every entry on the
    17k+5 grid and none above the VRAM limit.
-3. `span_1 + sum(span_i - overlap_i)` reaches `total_frames`.
+3. `span_1 + sum(span_i - max(overlap_i, 5))` reaches `total_frames`.
+3b. `total_frames` is on the grid: `(total_frames - 5) % 17 == 0`.
 3b. Every overlap is on the grid and smaller than its own span; the two
    lists are the same length.
 4. No timestamp exceeds `(span - 1) / fps` for its own chunk; all local.
